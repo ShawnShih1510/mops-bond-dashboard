@@ -11,7 +11,7 @@ st.set_page_config(
 )
 
 
-# 爬取 MOPS 公司債發行資料 (直接接收民國年/月/日)
+# 爬取 MOPS 公司債發行資料
 def fetch_bond_data(
     y1: int,
     m1: int,
@@ -26,6 +26,7 @@ def fetch_bond_data(
     url = "https://mopsov.twse.com.tw/mops/web/ajax_t120sb02_q5"
     target_co_id = co_id.strip()
 
+    # 參數補零與格式化
     payload = {
         "encodeURIComponent": "1",
         "step": "1",
@@ -33,11 +34,11 @@ def fetch_bond_data(
         "off": "1",
         "TYPEK": market_type,
         "year1": str(y1),
-        "month1": str(m1),
-        "day1": str(d1),
+        "month1": f"{int(m1):02d}",
+        "day1": f"{int(d1):02d}",
         "year2": str(y2),
-        "month2": str(m2),
-        "day2": str(d2),
+        "month2": f"{int(m2):02d}",
+        "day2": f"{int(d2):02d}",
         "co_id1": target_co_id,
         "co_id2": target_co_id,
         "co_name": co_name.strip(),
@@ -45,15 +46,30 @@ def fetch_bond_data(
     }
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "https://mopsov.twse.com.tw/mops/web/t120sb02_q5",
+        "Origin": "https://mopsov.twse.com.tw",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
     try:
         resp = requests.post(url, data=payload, headers=headers, timeout=25)
         resp.encoding = "utf-8"
 
-        tables = pd.read_html(io.StringIO(resp.text))
+        # 若 MOPS 回傳查無資料或內容中無表格
+        if (
+            "查無" in resp.text
+            or "無符合" in resp.text
+            or "<table" not in resp.text.lower()
+        ):
+            return pd.DataFrame()
+
+        # 解析 HTML 表格
+        try:
+            tables = pd.read_html(io.StringIO(resp.text))
+        except ValueError:
+            return pd.DataFrame()
 
         target_df = None
         for df in tables:
@@ -119,11 +135,11 @@ def fetch_bond_data(
         return target_df.reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"連線或資料解析異常：{e}")
+        st.error(f"連線異常：{e}")
         return pd.DataFrame()
 
 
-# 側邊欄：民國格式日期與條件設定
+# 側邊欄設定
 st.sidebar.header("🔍 查詢條件設定")
 market_opt = {"全部": "all", "上市": "sii", "上櫃": "otc", "興櫃": "rotc"}
 selected_market = st.sidebar.selectbox("市場別", list(market_opt.keys()))
@@ -174,117 +190,127 @@ if query_btn:
         )
         st.session_state["bond_data"] = df
 
-if "bond_data" in st.session_state and not st.session_state["bond_data"].empty:
-    raw_df = st.session_state["bond_data"].copy()
+if "bond_data" in st.session_state:
+    raw_df = st.session_state["bond_data"]
 
-    total_bonds = len(raw_df)
-    total_amount = (
-        raw_df["發行總額_數值"].sum() if "發行總額_數值" in raw_df.columns else 0
-    )
-    avg_rate = (
-        raw_df["票面利率_數值"].mean() if "票面利率_數值" in raw_df.columns else 0
-    )
-
-    m1_card, m2_card, m3_card = st.columns(3)
-    m1_card.metric("發行總筆數", f"{total_bonds:,} 筆")
-    m2_card.metric("發行總金額合計", f"{total_amount / 1e8:,.2f} 億元")
-    m3_card.metric("平均票面利率", f"{avg_rate:.3f} %")
-
-    st.markdown("---")
-
-    st.subheader("⚙️ 資料排序與篩選")
-    c1, c2, c3 = st.columns([2, 2, 2])
-
-    sort_options = [
-        c
-        for c in ["發行日期", "發行總額_數值", "票面利率_數值", "公司代號"]
-        if c in raw_df.columns
-    ]
-    with c1:
-        sort_by = st.selectbox(
-            "排序欄位", options=sort_options, index=0 if sort_options else 0
+    if not raw_df.empty:
+        total_bonds = len(raw_df)
+        total_amount = (
+            raw_df["發行總額_數值"].sum()
+            if "發行總額_數值" in raw_df.columns
+            else 0
         )
-    with c2:
-        sort_order = st.radio(
-            "排序方向", ["降冪 (大到小 / 新到舊)", "升冪 (小到大 / 舊到新)"], horizontal=True
-        )
-    with c3:
-        filter_co = st.multiselect(
-            "依公司名稱過濾",
-            options=raw_df["公司名稱"].unique()
-            if "公司名稱" in raw_df.columns
-            else [],
-            default=[],
+        avg_rate = (
+            raw_df["票面利率_數值"].mean()
+            if "票面利率_數值" in raw_df.columns
+            else 0
         )
 
-    display_df = raw_df.copy()
-    if filter_co and "公司名稱" in display_df.columns:
-        display_df = display_df[display_df["公司名稱"].isin(filter_co)]
+        m1_card, m2_card, m3_card = st.columns(3)
+        m1_card.metric("發行總筆數", f"{total_bonds:,} 筆")
+        m2_card.metric("發行總金額合計", f"{total_amount / 1e8:,.2f} 億元")
+        m3_card.metric("平均票面利率", f"{avg_rate:.3f} %")
 
-    ascending = True if "升冪" in sort_order else False
-    if sort_by in display_df.columns:
-        display_df = display_df.sort_values(by=sort_by, ascending=ascending)
+        st.markdown("---")
 
-    tab1, tab2 = st.tabs(["📋 資料清單", "📈 統計圖表分析"])
+        st.subheader("⚙️ 資料排序與篩選")
+        c1, c2, c3 = st.columns([2, 2, 2])
 
-    with tab1:
-        view_cols = [c for c in display_df.columns if not c.endswith("_數值")]
-        st.dataframe(
-            display_df[view_cols], use_container_width=True, hide_index=True
-        )
-
-        csv_data = display_df[view_cols].to_csv(index=False).encode("utf_8_sig")
-        st.download_button(
-            label="💾 匯出查詢結果 (CSV)",
-            data=csv_data,
-            file_name=f"bond_data_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-        )
-
-    with tab2:
-        col_chart1, col_chart2 = st.columns(2)
-        if (
-            "公司名稱" in display_df.columns
-            and "發行總額_數值" in display_df.columns
-        ):
-            top_emitters = (
-                display_df.groupby("公司名稱")["發行總額_數值"]
-                .sum()
-                .reset_index()
-                .sort_values(by="發行總額_數值", ascending=False)
-                .head(10)
+        sort_options = [
+            c
+            for c in ["發行日期", "發行總額_數值", "票面利率_數值", "公司代號"]
+            if c in raw_df.columns
+        ]
+        with c1:
+            sort_by = st.selectbox(
+                "排序欄位", options=sort_options, index=0 if sort_options else 0
             )
-            top_emitters["發行金額(億)"] = top_emitters["發行總額_數值"] / 1e8
-
-            fig1 = px.bar(
-                top_emitters,
-                x="公司名稱",
-                y="發行金額(億)",
-                title="發行金額前 10 大公司 (億元)",
-                text_auto=".2f",
-                color="發行金額(億)",
-                color_continuous_scale="Blues",
+        with c2:
+            sort_order = st.radio(
+                "排序方向",
+                ["降冪 (大到小 / 新到舊)", "升冪 (小到大 / 舊到新)"],
+                horizontal=True,
             )
-            col_chart1.plotly_chart(fig1, use_container_width=True)
-
-        if (
-            "發行日期" in display_df.columns
-            and "票面利率_數值" in display_df.columns
-        ):
-            fig2 = px.scatter(
-                display_df,
-                x="發行日期",
-                y="票面利率_數值",
-                size="發行總額_數值",
-                hover_data=[
-                    c
-                    for c in ["公司名稱", "債券簡稱"]
-                    if c in display_df.columns
-                ],
-                title="票面利率分佈 (氣泡大小代表發行金額)",
-                labels={"票面利率_數值": "票面利率 (%)"},
+        with c3:
+            filter_co = st.multiselect(
+                "依公司名稱過濾",
+                options=raw_df["公司名稱"].unique()
+                if "公司名稱" in raw_df.columns
+                else [],
+                default=[],
             )
-            col_chart2.plotly_chart(fig2, use_container_width=True)
 
-elif "bond_data" in st.session_state:
-    st.warning("查無符合條件的債券發行資料，請調整日期或條件後重新查詢。")
+        display_df = raw_df.copy()
+        if filter_co and "公司名稱" in display_df.columns:
+            display_df = display_df[display_df["公司名稱"].isin(filter_co)]
+
+        ascending = True if "升冪" in sort_order else False
+        if sort_by in display_df.columns:
+            display_df = display_df.sort_values(by=sort_by, ascending=ascending)
+
+        tab1, tab2 = st.tabs(["📋 資料清單", "📈 統計圖表分析"])
+
+        with tab1:
+            view_cols = [c for c in display_df.columns if not c.endswith("_數值")]
+            st.dataframe(
+                display_df[view_cols], use_container_width=True, hide_index=True
+            )
+
+            csv_data = display_df[view_cols].to_csv(index=False).encode(
+                "utf_8_sig"
+            )
+            st.download_button(
+                label="💾 匯出查詢結果 (CSV)",
+                data=csv_data,
+                file_name=f"bond_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+            )
+
+        with tab2:
+            col_chart1, col_chart2 = st.columns(2)
+            if (
+                "公司名稱" in display_df.columns
+                and "發行總額_數值" in display_df.columns
+            ):
+                top_emitters = (
+                    display_df.groupby("公司名稱")["發行總額_數值"]
+                    .sum()
+                    .reset_index()
+                    .sort_values(by="發行總額_數值", ascending=False)
+                    .head(10)
+                )
+                top_emitters["發行金額(億)"] = (
+                    top_emitters["發行總額_數值"] / 1e8
+                )
+
+                fig1 = px.bar(
+                    top_emitters,
+                    x="公司名稱",
+                    y="發行金額(億)",
+                    title="發行金額前 10 大公司 (億元)",
+                    text_auto=".2f",
+                    color="發行金額(億)",
+                    color_continuous_scale="Blues",
+                )
+                col_chart1.plotly_chart(fig1, use_container_width=True)
+
+            if (
+                "發行日期" in display_df.columns
+                and "票面利率_數值" in display_df.columns
+            ):
+                fig2 = px.scatter(
+                    display_df,
+                    x="發行日期",
+                    y="票面利率_數值",
+                    size="發行總額_數值",
+                    hover_data=[
+                        c
+                        for c in ["公司名稱", "債券簡稱"]
+                        if c in display_df.columns
+                    ],
+                    title="票面利率分佈 (氣泡大小代表發行金額)",
+                    labels={"票面利率_數值": "票面利率 (%)"},
+                )
+                col_chart2.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.warning("查無符合條件的債券發行資料，請調整日期或條件後重新查詢。")
