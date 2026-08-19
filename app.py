@@ -35,13 +35,13 @@ HEADERS_13 = [
 
 
 def create_mops_session():
-    """建立具備瀏覽器特徵的連線 Session"""
+    """建立具備完整瀏覽器特徵的連線 Session"""
     s = requests.Session()
     s.headers.update(
         {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
@@ -55,36 +55,43 @@ def create_mops_session():
 
 
 def parse_mops_html(html_text):
-    """精準過濾與解析觀測站 HTML 表格"""
+    """精準解析公開資訊觀測站 HTML 表格，完整抓取所有官方真實資料列"""
     soup = BeautifulSoup(html_text, "html.parser")
-    rows = soup.find_all("tr")
+    tables = soup.find_all("table")
     records = []
 
-    for r in rows:
-        cells = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
-        if len(cells) < 10:
-            continue
-        # 排除非資料標題行
-        if (
-            "公司代號" in cells[0]
-            or "市場別" in cells[0]
-            or "查無資料" in cells[0]
-        ):
-            continue
+    for tbl in tables:
+        rows = tbl.find_all("tr")
+        for r in rows:
+            cells = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
+            if len(cells) < 10:
+                continue
 
-        # 只要第一欄符合代號格式且包含公司債字樣
-        if any("公司債" in c or "新台幣" in c for c in cells):
-            while len(cells) < 13:
-                cells.append("")
-            records.append(cells[:13])
+            # 排除非資料列、表頭列、無效提示字樣
+            first_cell = cells[0]
+            if (
+                "公司代號" in first_cell
+                or "市場別" in first_cell
+                or "查無資料" in first_cell
+                or "合計" in first_cell
+            ):
+                continue
+
+            # 只要第一欄為股票代號或統一編號（英數字）且包含公司債或幣別
+            if re.match(r"^[0-9A-Za-z]+$", first_cell) and any(
+                "公司債" in c or "新台幣" in c or "外幣" in c for c in cells
+            ):
+                while len(cells) < 13:
+                    cells.append("")
+                records.append(cells[:13])
 
     if records:
         return pd.DataFrame(records, columns=HEADERS_13)
     return pd.DataFrame()
 
 
-def fetch_from_mops_live(year, market_code, params):
-    """向觀測站發送非同步查詢請求"""
+def fetch_from_mops(year, market_code, params):
+    """直接向觀測站發送精確查詢請求"""
     url = "https://mopsov.twse.com.tw/mops/web/ajax_t120sb02_q5"
     s = create_mops_session()
 
@@ -97,7 +104,7 @@ def fetch_from_mops_live(year, market_code, params):
         "encodeURIComponent": "1",
         "step": "1",
         "firstin": "true",
-        "offering_type": "5",
+        "offering_type": "5",  # 普通公司債
         "TYPEK": market_code,
         "code1": params.get("bond_id", ""),
         "code2": params.get("bond_id", ""),
@@ -115,108 +122,42 @@ def fetch_from_mops_live(year, market_code, params):
     }
 
     try:
-        resp = s.post(url, data=payload, timeout=8, verify=False)
+        resp = s.post(url, data=payload, timeout=15, verify=False)
         resp.encoding = "utf-8"
-        if (
-            "無法呈現" not in resp.text
-            and "FOR SECURITY REASONS" not in resp.text
-        ):
-            return parse_mops_html(resp.text)
+        return parse_mops_html(resp.text)
     except Exception:
-        pass
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=86400)
-def load_comprehensive_database():
-    """全量標準歷史發行資料庫（確保各年度資料完整收錄）"""
-    # 支援 110~115 年全量基準母體
-    np.random.seed(113)
-    base_data = []
-
-    # 代表性發行企業名單
-    companies = [
-        ("2330", "台積電", 16000000000, 1.60),
-        ("2317", "鴻海", 10000000000, 1.58),
-        ("2882", "國泰金", 12000000000, 1.65),
-        ("2881", "富邦金", 9000000000, 1.70),
-        ("1328", "中油", 6000000000, 1.58),
-        ("2002", "中鋼", 7600000000, 1.79),
-        ("1402", "遠東新", 8000000000, 2.03),
-        ("2883", "凱基金", 6000000000, 1.80),
-        ("1301", "台塑", 7500000000, 1.55),
-        ("2823", "凱基人壽", 7000000000, 3.88),
-        ("2833", "台灣人壽", 4600000000, 3.88),
-        ("2858", "中租迪和", 2400000000, 2.00),
-        ("1102", "亞泥", 4300000000, 1.92),
-        ("2327", "國巨", 4000000000, 1.80),
-        ("4904", "遠傳", 1500000000, 1.75),
-        ("2542", "興富發", 2000000000, 1.80),
-    ]
-
-    # 生成 110~115 各年度真實權重分佈檔數（113年約 349 檔）
-    year_distribution = {
-        110: 280,
-        111: 295,
-        112: 310,
-        113: 349,
-        114: 320,
-        115: 180,
-    }
-
-    for yr, count in year_distribution.items():
-        for i in range(count):
-            c_code, c_name, base_amt, base_rate = companies[i % len(companies)]
-            m = (i % 12) + 1
-            d = ((i * 3) % 28) + 1
-            rate = round(base_rate + np.random.uniform(-0.35, 0.45), 3)
-            amt = int(base_amt * np.random.choice([0.4, 0.6, 0.8, 1.0, 1.2]))
-
-            base_data.append(
-                [
-                    c_code,
-                    "普通公司債",
-                    c_name,
-                    f"B{c_code[:3]}{yr}{i:02d}",
-                    f"P{yr-100}{c_name[:2]}{i%5+1}",
-                    f"{yr}/{m:02d}/{d:02d}",
-                    f"{rate:.6f}",
-                    f"{yr+5}/{m:02d}/{d:02d}",
-                    f"{yr}-{i%4+1}",
-                    np.random.choice(["甲", "乙", "丙", ""]),
-                    "新台幣",
-                    f"{amt:,}",
-                    f"{amt:,}",
-                ]
-            )
-
-    return pd.DataFrame(base_data, columns=HEADERS_13)
+        return pd.DataFrame()
 
 
 def query_multi_year_engine(params):
-    """智慧型檢索整合引擎"""
+    """多年度全量即時檢索核心（100% 官方真實數據）"""
     y_start = int(params.get("y1", 113))
     y_end = int(params.get("y2", 113))
     target_market = params.get("typek", "all")
-    markets = ["sii", "otc"] if target_market == "all" else [target_market]
 
-    live_collected = []
+    if target_market == "all":
+        markets = ["sii", "otc", "rotc", "pub"]
+    else:
+        markets = [target_market]
 
-    # 1. 嘗試即時爬取觀測站
+    collected = []
+
+    # 分年、分市場向公開資訊觀測站取得所有真實資料
     for yr in range(y_start, y_end + 1):
         for m in markets:
-            df_live = fetch_from_mops_live(yr, m, params)
-            if not df_live.empty:
-                live_collected.append(df_live)
+            df_mops = fetch_from_mops(yr, m, params)
+            if not df_mops.empty:
+                collected.append(df_mops)
 
-    # 2. 若爬蟲成功取得足量資料則使用即時資料；若被 WAF 阻擋則自動啟用全量資料庫
-    if sum(len(x) for x in live_collected) >= 50:
-        combined = pd.concat(live_collected, ignore_index=True)
-        source_msg = "已即時連線公開資訊觀測站抓取"
-    else:
-        combined = load_comprehensive_database()
-        source_msg = "已成功載入跨年度標準資料庫"
+    if not collected:
+        return (
+            pd.DataFrame(),
+            f"公開資訊觀測站於民國 {y_start} ~ {y_end} 年所選條件下查無資料，或連線逾時。",
+        )
 
+    combined = pd.concat(collected, ignore_index=True)
+
+    # 依照「債券代碼」與「發行日期」等唯一鍵進行嚴格去重
     combined.drop_duplicates(
         subset=["公司代號", "債券代碼", "發行日期", "債券期別", "券別"],
         inplace=True,
@@ -242,7 +183,7 @@ def query_multi_year_engine(params):
             combined["債券代碼"].astype(str).str.contains(bid, case=False, na=False)
         ]
 
-    # 日期數值區間篩選
+    # 日期精確數值過濾
     def get_date_score(d_str):
         try:
             parts = str(d_str).strip().split("/")
@@ -272,16 +213,21 @@ def query_multi_year_engine(params):
     ].copy()
 
     if not filtered_df.empty:
+        # 清理並轉換金額欄位
         filtered_df["發行總額_數值"] = (
             filtered_df["發行總額"].astype(str).str.replace(",", "").str.strip()
         )
         filtered_df["發行總額_數值"] = pd.to_numeric(
             filtered_df["發行總額_數值"], errors="coerce"
         ).fillna(0)
+
+        # 清理並轉換利率欄位
         filtered_df["票面利率_數值"] = pd.to_numeric(
             filtered_df["票面利率"].astype(str).str.replace("%", "").str.strip(),
             errors="coerce",
         ).fillna(0)
+
+        # 清理月底餘額
         filtered_df["月底餘額_數值"] = (
             filtered_df["月底餘額"].astype(str).str.replace(",", "").str.strip()
         )
@@ -289,14 +235,14 @@ def query_multi_year_engine(params):
             filtered_df["月底餘額_數值"], errors="coerce"
         ).fillna(0)
 
-        # 提取發行年度
+        # 提取發行民國年度（例如 113年）供統計分組
         filtered_df["發行年度"] = filtered_df["發行日期"].apply(
             lambda x: str(x).split("/")[0] + "年" if "/" in str(x) else ""
         )
 
         return (
             filtered_df,
-            f"{source_msg}（民國 {y_start} 年 ~ {y_end} 年）！",
+            f"已成功從公開資訊觀測站取得民國 {y_start} 年 ~ {y_end} 年真實發行紀錄",
         )
 
     return pd.DataFrame(), "所選條件與區間內查無符合的發行紀錄。"
@@ -314,7 +260,7 @@ with st.sidebar.form(key="mops_search_form"):
         options=["all", "sii", "otc", "rotc", "pub"],
         index=0,
         format_func=lambda x: {
-            "all": "全部 (上市+上櫃)",
+            "all": "全部 (上市+上櫃+興櫃+公開發行)",
             "sii": "上市",
             "otc": "上櫃",
             "rotc": "興櫃",
@@ -365,14 +311,14 @@ if submit_btn:
         "d2": str(d2),
         "is_mature": mature_status[0],
     }
-    with st.spinner(f"正在檢索民國 {y1} 年 ~ {y2} 年債券發行數據..."):
+    with st.spinner(f"正在連線公開資訊觀測站檢索民國 {y1} 年 ~ {y2} 年數據..."):
         df_res, msg_res = query_multi_year_engine(params)
     st.session_state["bond_data"] = df_res
     st.session_state["msg"] = msg_res
     st.session_state["curr_y1"] = y1
     st.session_state["curr_y2"] = y2
 
-# 預設初始化 (113 年)
+# 預設初始化 (首次載入 113 全年度)
 if "bond_data" not in st.session_state:
     p_init = {
         "typek": "all",
@@ -395,7 +341,7 @@ raw_df = st.session_state.get("bond_data", pd.DataFrame())
 if not raw_df.empty:
     st.success(
         f"🎉 {st.session_state.get('msg', '成功')}！共取得"
-        f" **{len(raw_df)}** 筆債券發行紀錄。"
+        f" **{len(raw_df)}** 筆真實債券發行紀錄。"
     )
 
     # 1. 核心看板 (單位：億新台幣)
@@ -511,7 +457,7 @@ if not raw_df.empty:
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with ch2:
-        # 單年度獨立統計發行規模（非累計）
+        # 單年度獨立統計發行規模
         yearly_summary = (
             raw_df[raw_df["發行年度"] != ""]
             .groupby("發行年度", as_index=False)["發行總額_數值"]
