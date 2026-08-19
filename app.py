@@ -1,5 +1,5 @@
 import io
-from datetime import date, datetime
+from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import requests
@@ -11,18 +11,20 @@ st.set_page_config(
 )
 
 
-# 即時爬取 MOPS 公司債發行資料
+# 爬取 MOPS 公司債發行資料 (直接接收民國年/月/日)
 def fetch_bond_data(
-    start_d: date,
-    end_d: date,
+    y1: int,
+    m1: int,
+    d1: int,
+    y2: int,
+    m2: int,
+    d2: int,
     co_id: str = "",
     co_name: str = "",
     market_type: str = "all",
 ):
-    url = "https://mopsov.twse.com.tw/mops/web/t120sb02_q5"
-
-    y1, m1, d1 = start_d.year - 1911, start_d.month, start_d.day
-    y2, m2, d2 = end_d.year - 1911, end_d.month, end_d.day
+    url = "https://mopsov.twse.com.tw/mops/web/ajax_t120sb02_q5"
+    target_co_id = co_id.strip()
 
     payload = {
         "encodeURIComponent": "1",
@@ -31,43 +33,65 @@ def fetch_bond_data(
         "off": "1",
         "TYPEK": market_type,
         "year1": str(y1),
-        "month1": f"{m1:02d}",
-        "day1": f"{d1:02d}",
+        "month1": str(m1),
+        "day1": str(d1),
         "year2": str(y2),
-        "month2": f"{m2:02d}",
-        "day2": f"{d2:02d}",
-        "co_id": co_id.strip(),
+        "month2": str(m2),
+        "day2": str(d2),
+        "co_id1": target_co_id,
+        "co_id2": target_co_id,
         "co_name": co_name.strip(),
+        "is_pay": "Y",
     }
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     try:
-        resp = requests.post(url, data=payload, headers=headers, timeout=20)
+        resp = requests.post(url, data=payload, headers=headers, timeout=25)
         resp.encoding = "utf-8"
 
         tables = pd.read_html(io.StringIO(resp.text))
 
         target_df = None
         for df in tables:
-            if any("公司代號" in str(col) for col in df.columns) or any(
-                "債券簡稱" in str(col) for col in df.columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [
+                    "_".join([str(c) for c in col if str(c) != "nan"]).strip()
+                    for col in df.columns
+                ]
+
+            cols_str = " ".join([str(c) for c in df.columns])
+            row0_str = (
+                " ".join([str(v) for v in df.iloc[0].values])
+                if len(df) > 0
+                else ""
+            )
+
+            if (
+                "公司代號" in cols_str
+                or "債券簡稱" in cols_str
+                or "公司代號" in row0_str
             ):
+                if "公司代號" in row0_str and "公司代號" not in cols_str:
+                    df.columns = df.iloc[0]
+                    df = df.iloc[1:].reset_index(drop=True)
                 target_df = df
                 break
 
         if target_df is None or target_df.empty:
             return pd.DataFrame()
 
-        if isinstance(target_df.columns, pd.MultiIndex):
-            target_df.columns = [
-                "_".join([str(c) for c in col if str(c) != "nan"]).strip()
-                for col in target_df.columns
-            ]
+        target_df.columns = [
+            str(c).replace(" ", "").strip() for c in target_df.columns
+        ]
 
-        target_df.columns = [str(c).replace(" ", "") for c in target_df.columns]
+        if "公司代號" in target_df.columns:
+            target_df = target_df[
+                target_df["公司代號"].astype(str).str.strip() != "公司代號"
+            ]
 
         if "發行總額" in target_df.columns:
             target_df["發行總額_數值"] = (
@@ -75,34 +99,54 @@ def fetch_bond_data(
                 .astype(str)
                 .str.replace(",", "")
                 .str.replace("--", "0")
+                .str.strip()
             )
             target_df["發行總額_數值"] = pd.to_numeric(
                 target_df["發行總額_數值"], errors="coerce"
             ).fillna(0)
 
         if "票面利率" in target_df.columns:
+            target_df["票面利率_數值"] = (
+                target_df["票面利率"]
+                .astype(str)
+                .str.replace("%", "")
+                .str.strip()
+            )
             target_df["票面利率_數值"] = pd.to_numeric(
-                target_df["票面利率"].astype(str).str.replace("%", ""),
-                errors="coerce",
+                target_df["票面利率_數值"], errors="coerce"
             ).fillna(0.0)
 
-        return target_df
+        return target_df.reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"連線或解析失敗：{e}")
+        st.error(f"連線或資料解析異常：{e}")
         return pd.DataFrame()
 
 
-# 側邊欄查詢設定
+# 側邊欄：民國格式日期與條件設定
 st.sidebar.header("🔍 查詢條件設定")
 market_opt = {"全部": "all", "上市": "sii", "上櫃": "otc", "興櫃": "rotc"}
 selected_market = st.sidebar.selectbox("市場別", list(market_opt.keys()))
 
-col_d1, col_d2 = st.sidebar.columns(2)
+st.sidebar.markdown("**發行起日 (民國)**")
+col_y1, col_m1, col_d1 = st.sidebar.columns(3)
+with col_y1:
+    y1 = st.number_input("年", min_value=80, max_value=150, value=113, step=1)
+with col_m1:
+    m1 = st.number_input("月", min_value=1, max_value=12, value=1, step=1)
 with col_d1:
-    start_date = st.date_input("發行起日", date(2024, 1, 1))
+    d1 = st.number_input("日", min_value=1, max_value=31, value=1, step=1)
+
+st.sidebar.markdown("**發行迄日 (民國)**")
+col_y2, col_m2, col_d2 = st.sidebar.columns(3)
+with col_y2:
+    y2 = st.number_input(
+        "年 ", min_value=80, max_value=150, value=113, step=1
+    )
+with col_m2:
+    m2 = st.number_input("月 ", min_value=1, max_value=12, value=12, step=1)
 with col_d2:
-    end_date = st.date_input("發行迄日", date(2024, 12, 31))
+    d2 = st.number_input("日 ", min_value=1, max_value=31, value=31, step=1)
 
 input_co_id = st.sidebar.text_input("公司代號（選填，如：1328）", "")
 input_co_name = st.sidebar.text_input("公司名稱（選填，如：中油）", "")
@@ -118,8 +162,12 @@ st.caption(
 if query_btn:
     with st.spinner("正在向公開資訊觀測站請求資料..."):
         df = fetch_bond_data(
-            start_date,
-            end_date,
+            y1,
+            m1,
+            d1,
+            y2,
+            m2,
+            d2,
             input_co_id,
             input_co_name,
             market_opt[selected_market],
@@ -137,21 +185,24 @@ if "bond_data" in st.session_state and not st.session_state["bond_data"].empty:
         raw_df["票面利率_數值"].mean() if "票面利率_數值" in raw_df.columns else 0
     )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("發行總筆數", f"{total_bonds:,} 筆")
-    m2.metric("發行總金額合計", f"{total_amount / 1e8:,.2f} 億元")
-    m3.metric("平均票面利率", f"{avg_rate:.3f} %")
+    m1_card, m2_card, m3_card = st.columns(3)
+    m1_card.metric("發行總筆數", f"{total_bonds:,} 筆")
+    m2_card.metric("發行總金額合計", f"{total_amount / 1e8:,.2f} 億元")
+    m3_card.metric("平均票面利率", f"{avg_rate:.3f} %")
 
     st.markdown("---")
 
     st.subheader("⚙️ 資料排序與篩選")
     c1, c2, c3 = st.columns([2, 2, 2])
 
+    sort_options = [
+        c
+        for c in ["發行日期", "發行總額_數值", "票面利率_數值", "公司代號"]
+        if c in raw_df.columns
+    ]
     with c1:
         sort_by = st.selectbox(
-            "排序欄位",
-            options=["發行日期", "發行總額_數值", "票面利率_數值", "公司代號"],
-            index=0,
+            "排序欄位", options=sort_options, index=0 if sort_options else 0
         )
     with c2:
         sort_order = st.radio(
@@ -167,7 +218,7 @@ if "bond_data" in st.session_state and not st.session_state["bond_data"].empty:
         )
 
     display_df = raw_df.copy()
-    if filter_co:
+    if filter_co and "公司名稱" in display_df.columns:
         display_df = display_df[display_df["公司名稱"].isin(filter_co)]
 
     ascending = True if "升冪" in sort_order else False
@@ -225,7 +276,11 @@ if "bond_data" in st.session_state and not st.session_state["bond_data"].empty:
                 x="發行日期",
                 y="票面利率_數值",
                 size="發行總額_數值",
-                hover_data=["公司名稱", "債券簡稱"],
+                hover_data=[
+                    c
+                    for c in ["公司名稱", "債券簡稱"]
+                    if c in display_df.columns
+                ],
                 title="票面利率分佈 (氣泡大小代表發行金額)",
                 labels={"票面利率_數值": "票面利率 (%)"},
             )
