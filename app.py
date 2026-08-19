@@ -1,276 +1,235 @@
-# app.py
-import os
-import numpy as np
+import io
+from datetime import date, datetime
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="公開資訊觀測站 - 普通公司債歷年查詢與分析系統",
-    page_icon="🏛️",
+    page_title="台灣上市櫃公司債券發行資訊互動分析儀表板",
     layout="wide",
 )
 
-HEADERS_13 = [
-    "公司代號",
-    "債券種類",
-    "公司名稱",
-    "債券代碼",
-    "債券簡稱",
-    "發行日期",
-    "票面利率",
-    "到期日期",
-    "債券期別",
-    "券別",
-    "幣別",
-    "發行總額",
-    "月底餘額",
-]
 
+# 即時爬取 MOPS 公司債發行資料
+def fetch_bond_data(
+    start_d: date,
+    end_d: date,
+    co_id: str = "",
+    co_name: str = "",
+    market_type: str = "all",
+):
+    url = "https://mopsov.twse.com.tw/mops/web/t120sb02_q5"
 
-@st.cache_data
-def load_data():
-    csv_path = "mops_bonds_data.csv"
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path, dtype=str)
-    else:
+    y1, m1, d1 = start_d.year - 1911, start_d.month, start_d.day
+    y2, m2, d2 = end_d.year - 1911, end_d.month, end_d.day
+
+    payload = {
+        "encodeURIComponent": "1",
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "TYPEK": market_type,
+        "year1": str(y1),
+        "month1": f"{m1:02d}",
+        "day1": f"{d1:02d}",
+        "year2": str(y2),
+        "month2": f"{m2:02d}",
+        "day2": f"{d2:02d}",
+        "co_id": co_id.strip(),
+        "co_name": co_name.strip(),
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        resp = requests.post(url, data=payload, headers=headers, timeout=20)
+        resp.encoding = "utf-8"
+
+        tables = pd.read_html(io.StringIO(resp.text))
+
+        target_df = None
+        for df in tables:
+            if any("公司代號" in str(col) for col in df.columns) or any(
+                "債券簡稱" in str(col) for col in df.columns
+            ):
+                target_df = df
+                break
+
+        if target_df is None or target_df.empty:
+            return pd.DataFrame()
+
+        if isinstance(target_df.columns, pd.MultiIndex):
+            target_df.columns = [
+                "_".join([str(c) for c in col if str(c) != "nan"]).strip()
+                for col in target_df.columns
+            ]
+
+        target_df.columns = [str(c).replace(" ", "") for c in target_df.columns]
+
+        if "發行總額" in target_df.columns:
+            target_df["發行總額_數值"] = (
+                target_df["發行總額"]
+                .astype(str)
+                .str.replace(",", "")
+                .str.replace("--", "0")
+            )
+            target_df["發行總額_數值"] = pd.to_numeric(
+                target_df["發行總額_數值"], errors="coerce"
+            ).fillna(0)
+
+        if "票面利率" in target_df.columns:
+            target_df["票面利率_數值"] = pd.to_numeric(
+                target_df["票面利率"].astype(str).str.replace("%", ""),
+                errors="coerce",
+            ).fillna(0.0)
+
+        return target_df
+
+    except Exception as e:
+        st.error(f"連線或解析失敗：{e}")
         return pd.DataFrame()
 
-    # 資料前處理與數值轉換
-    df["發行總額_數值"] = (
-        df["發行總額"].astype(str).str.replace(",", "").str.strip()
-    )
-    df["發行總額_數值"] = pd.to_numeric(
-        df["發行總額_數值"], errors="coerce"
-    ).fillna(0)
 
-    df["票面利率_數值"] = pd.to_numeric(
-        df["票面利率"].astype(str).str.replace("%", "").str.strip(),
-        errors="coerce",
-    ).fillna(0)
-    df["月底餘額_數值"] = (
-        df["月底餘額"].astype(str).str.replace(",", "").str.strip()
-    )
-    df["月底餘額_數值"] = pd.to_numeric(
-        df["月底餘額_數值"], errors="coerce"
-    ).fillna(0)
+# 側邊欄查詢設定
+st.sidebar.header("🔍 查詢條件設定")
+market_opt = {"全部": "all", "上市": "sii", "上櫃": "otc", "興櫃": "rotc"}
+selected_market = st.sidebar.selectbox("市場別", list(market_opt.keys()))
 
-    def get_date_score(d_str):
-        try:
-            parts = str(d_str).strip().split("/")
-            if len(parts) == 3:
-                return (
-                    int(parts[0]) * 10000 + int(parts[1]) * 100 + int(parts[2])
-                )
-        except Exception:
-            pass
-        return 0
+col_d1, col_d2 = st.sidebar.columns(2)
+with col_d1:
+    start_date = st.date_input("發行起日", date(2024, 1, 1))
+with col_d2:
+    end_date = st.date_input("發行迄日", date(2024, 12, 31))
 
-    df["日期_數值"] = df["發行日期"].apply(get_date_score)
-    df["發行年度"] = df["發行日期"].apply(
-        lambda x: str(x).split("/")[0] + "年" if "/" in str(x) else ""
-    )
-    return df
+input_co_id = st.sidebar.text_input("公司代號（選填，如：1328）", "")
+input_co_name = st.sidebar.text_input("公司名稱（選填，如：中油）", "")
 
+query_btn = st.sidebar.button("🚀 開始查詢", type="primary", use_container_width=True)
 
-df_all = load_data()
-
+# 主頁面
 st.title("🏛️ 台灣上市櫃公司債券發行資訊互動分析儀表板")
-st.caption("串接公開資訊觀測站 (MOPS) 普通公司債 ➜ 歷史資料查詢 (t120sb02_q5)")
+st.caption(
+    "串接公開資訊觀測站 (MOPS) 普通公司債 ➜ 歷史資料查詢 (t120sb02_q5)"
+)
 
-st.sidebar.header("🔍 1. 查詢參數設定")
+if query_btn:
+    with st.spinner("正在向公開資訊觀測站請求資料..."):
+        df = fetch_bond_data(
+            start_date,
+            end_date,
+            input_co_id,
+            input_co_name,
+            market_opt[selected_market],
+        )
+        st.session_state["bond_data"] = df
 
-with st.sidebar.form(key="search_form"):
-    st.subheader("📅 發行日期區間 (民國年)")
-    c1, c2 = st.columns(2)
-    with c1:
-        y1 = st.number_input("開始年", value=113, min_value=90, max_value=120)
-        m1 = st.number_input("開始月", value=1, min_value=1, max_value=12)
-        d1 = st.number_input("開始日", value=1, min_value=1, max_value=31)
-    with c2:
-        y2 = st.number_input("結束年", value=113, min_value=90, max_value=120)
-        m2 = st.number_input("結束月", value=12, min_value=1, max_value=12)
-        d2 = st.number_input("結束日", value=31, min_value=1, max_value=31)
+if "bond_data" in st.session_state and not st.session_state["bond_data"].empty:
+    raw_df = st.session_state["bond_data"].copy()
 
-    st.subheader("🏢 公司與代號條件 (選填)")
-    comp_id = st.text_input("依發行公司代號查詢", placeholder="例：2330、2883")
-    comp_name = st.text_input("依發行公司名稱查詢", placeholder="例：台積電、中油")
-    bond_id = st.text_input("依債券代號查詢", placeholder="例：B88101")
-
-    submit_btn = st.form_submit_button(
-        "🚀 送出查詢觀測站", type="primary", use_container_width=True
+    total_bonds = len(raw_df)
+    total_amount = (
+        raw_df["發行總額_數值"].sum() if "發行總額_數值" in raw_df.columns else 0
+    )
+    avg_rate = (
+        raw_df["票面利率_數值"].mean() if "票面利率_數值" in raw_df.columns else 0
     )
 
-if df_all.empty:
-    st.error(
-        "⚠️ 尚未找到 `mops_bonds_data.csv`，請先於本機執行 `python update_data.py` 產出資料檔並上傳至 GitHub。"
-    )
-    st.stop()
-
-# 執行篩選
-start_score = y1 * 10000 + m1 * 100 + d1
-end_score = y2 * 10000 + m2 * 100 + d2
-
-filtered = df_all[
-    (df_all["日期_數值"] >= start_score) & (df_all["日期_數值"] <= end_score)
-].copy()
-
-if comp_id.strip():
-    filtered = filtered[
-        filtered["公司代號"]
-        .astype(str)
-        .str.contains(comp_id.strip(), case=False, na=False)
-    ]
-if comp_name.strip():
-    filtered = filtered[
-        filtered["公司名稱"]
-        .astype(str)
-        .str.contains(comp_name.strip(), case=False, na=False)
-    ]
-if bond_id.strip():
-    filtered = filtered[
-        filtered["債券代碼"]
-        .astype(str)
-        .str.contains(bond_id.strip(), case=False, na=False)
-    ]
-
-if not filtered.empty:
-    st.success(
-        f"🎉 成功獲取民國 {y1} 年 ~ {y2} 年之債券發行紀錄！共取得 **{len(filtered)}** 筆真實官方紀錄。"
-    )
-
-    # 1. 關鍵指標卡
-    k1, k2, k3, k4 = st.columns(4)
-    tot_amt = filtered["發行總額_數值"].sum()
-    tot_amt_billion = tot_amt / 100_000_000
-    k1.metric("總發行規模 (億新台幣)", f"{tot_amt_billion:,.2f} 億元")
-    k2.metric("發行總檔數", f"{len(filtered):,} 檔")
-    valid_rates = filtered[filtered["票面利率_數值"] > 0]["票面利率_數值"]
-    k3.metric(
-        "平均票面利率",
-        f"{valid_rates.mean():.3f}%" if not valid_rates.empty else "N/A",
-    )
-    k4.metric("涵蓋發行公司", f"{filtered['公司名稱'].nunique():,} 家")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("發行總筆數", f"{total_bonds:,} 筆")
+    m2.metric("發行總金額合計", f"{total_amount / 1e8:,.2f} 億元")
+    m3.metric("平均票面利率", f"{avg_rate:.3f} %")
 
     st.markdown("---")
 
-    # 2. 排序控制台
-    st.subheader("⚙️ 2. 進一步互動分析與指令排序")
-    ctrl1, ctrl2, ctrl3 = st.columns(3)
-    with ctrl1:
+    st.subheader("⚙️ 資料排序與篩選")
+    c1, c2, c3 = st.columns([2, 2, 2])
+
+    with c1:
         sort_by = st.selectbox(
-            "選擇分析排序維度",
-            options=["發行日期", "發行總額 (金額大小)", "票面利率", "公司名稱", "公司代號"],
+            "排序欄位",
+            options=["發行日期", "發行總額_數值", "票面利率_數值", "公司代號"],
             index=0,
         )
-    with ctrl2:
-        sort_direction = st.radio(
-            "排序方向",
-            options=[
-                "由大到小 / 由新到舊 (遞減)",
-                "由小到大 / 由舊到新 (遞增)",
-            ],
-            horizontal=True,
+    with c2:
+        sort_order = st.radio(
+            "排序方向", ["降冪 (大到小 / 新到舊)", "升冪 (小到大 / 舊到新)"], horizontal=True
         )
-    with ctrl3:
-        all_comps = ["全部公司"] + sorted(
-            [x for x in filtered["公司名稱"].unique() if pd.notna(x) and x]
-        )
-        filter_comp = st.selectbox("依發行公司篩選", options=all_comps)
-
-    display_df = filtered.copy()
-    if filter_comp != "全部公司":
-        display_df = display_df[display_df["公司名稱"] == filter_comp]
-
-    is_asc = sort_direction == "由小到大 / 由舊到新 (遞增)"
-    if sort_by == "發行日期":
-        display_df = display_df.sort_values(by="日期_數值", ascending=is_asc)
-    elif "發行總額" in sort_by:
-        display_df = display_df.sort_values(
-            by="發行總額_數值", ascending=is_asc
-        )
-    elif "票面利率" in sort_by:
-        display_df = display_df.sort_values(
-            by="票面利率_數值", ascending=is_asc
-        )
-    elif sort_by == "公司名稱":
-        display_df = display_df.sort_values(by="公司名稱", ascending=is_asc)
-    elif sort_by == "公司代號":
-        display_df = display_df.sort_values(by="公司代號", ascending=is_asc)
-
-    st.subheader("📋 債券發行詳細清單 (與觀測站欄位完全一致)")
-    st.dataframe(display_df[HEADERS_13], use_container_width=True, height=420)
-
-    # 3. 視覺化統計圖表
-    st.markdown("---")
-    st.subheader("📊 3. 視覺化統計圖表")
-    ch1, ch2 = st.columns(2)
-
-    with ch1:
-        top_companies = (
-            filtered[filtered["公司名稱"] != ""]
-            .groupby("公司名稱")["發行總額_數值"]
-            .sum()
-            .reset_index()
-        )
-        top_companies = top_companies.sort_values(
-            by="發行總額_數值", ascending=False
-        ).head(10)
-        top_companies["發行金額(億元)"] = (
-            top_companies["發行總額_數值"] / 100_000_000
+    with c3:
+        filter_co = st.multiselect(
+            "依公司名稱過濾",
+            options=raw_df["公司名稱"].unique()
+            if "公司名稱" in raw_df.columns
+            else [],
+            default=[],
         )
 
-        fig_bar = px.bar(
-            top_companies,
-            x="發行金額(億元)",
-            y="公司名稱",
-            orientation="h",
-            title=f"🏢 {y1} ~ {y2} 年發行規模 Top 10 公司 (億新台幣)",
-            labels={
-                "發行金額(億元)": "發行金額 (億新台幣)",
-                "公司名稱": "公司名稱",
-            },
-            color="發行金額(億元)",
-            color_continuous_scale="Blues",
-        )
-        fig_bar.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_bar, use_container_width=True)
+    display_df = raw_df.copy()
+    if filter_co:
+        display_df = display_df[display_df["公司名稱"].isin(filter_co)]
 
-    with ch2:
-        yearly_summary = (
-            filtered[filtered["發行年度"] != ""]
-            .groupby("發行年度", as_index=False)["發行總額_數值"]
-            .sum()
-        )
-        yearly_summary["發行金額(億元)"] = (
-            yearly_summary["發行總額_數值"] / 100_000_000
-        )
-        yearly_summary = yearly_summary.sort_values(by="發行年度")
+    ascending = True if "升冪" in sort_order else False
+    if sort_by in display_df.columns:
+        display_df = display_df.sort_values(by=sort_by, ascending=ascending)
 
-        fig_year = px.bar(
-            yearly_summary,
-            x="發行年度",
-            y="發行金額(億元)",
-            title=f"📈 {y1} ~ {y2} 年歷年債券發行總額趨勢",
-            labels={
-                "發行年度": "民國年度",
-                "發行金額(億元)": "發行總額 (億新台幣)",
-            },
-            color="發行年度",
-            text_auto=".2f",
-        )
-        st.plotly_chart(fig_year, use_container_width=True)
+    tab1, tab2 = st.tabs(["📋 資料清單", "📈 統計圖表分析"])
 
-    st.markdown("---")
-    csv_bytes = display_df[HEADERS_13].to_csv(
-        index=False, encoding="utf-8-sig"
-    ).encode("utf-8-sig")
-    st.download_button(
-        label="📥 匯出當前分析與排序後的表格 (CSV 格式)",
-        data=csv_bytes,
-        file_name=f"mops_bonds_{y1}_{y2}_analysis.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-else:
-    st.warning("⚠️ 所選條件查無符合的發行紀錄。")
+    with tab1:
+        view_cols = [c for c in display_df.columns if not c.endswith("_數值")]
+        st.dataframe(
+            display_df[view_cols], use_container_width=True, hide_index=True
+        )
+
+        csv_data = display_df[view_cols].to_csv(index=False).encode("utf_8_sig")
+        st.download_button(
+            label="💾 匯出查詢結果 (CSV)",
+            data=csv_data,
+            file_name=f"bond_data_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
+
+    with tab2:
+        col_chart1, col_chart2 = st.columns(2)
+        if (
+            "公司名稱" in display_df.columns
+            and "發行總額_數值" in display_df.columns
+        ):
+            top_emitters = (
+                display_df.groupby("公司名稱")["發行總額_數值"]
+                .sum()
+                .reset_index()
+                .sort_values(by="發行總額_數值", ascending=False)
+                .head(10)
+            )
+            top_emitters["發行金額(億)"] = top_emitters["發行總額_數值"] / 1e8
+
+            fig1 = px.bar(
+                top_emitters,
+                x="公司名稱",
+                y="發行金額(億)",
+                title="發行金額前 10 大公司 (億元)",
+                text_auto=".2f",
+                color="發行金額(億)",
+                color_continuous_scale="Blues",
+            )
+            col_chart1.plotly_chart(fig1, use_container_width=True)
+
+        if (
+            "發行日期" in display_df.columns
+            and "票面利率_數值" in display_df.columns
+        ):
+            fig2 = px.scatter(
+                display_df,
+                x="發行日期",
+                y="票面利率_數值",
+                size="發行總額_數值",
+                hover_data=["公司名稱", "債券簡稱"],
+                title="票面利率分佈 (氣泡大小代表發行金額)",
+                labels={"票面利率_數值": "票面利率 (%)"},
+            )
+            col_chart2.plotly_chart(fig2, use_container_width=True)
+
+elif "bond_data" in st.session_state:
+    st.warning("查無符合條件的債券發行資料，請調整日期或條件後重新查詢。")
